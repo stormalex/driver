@@ -1,0 +1,87 @@
+/*2014-11-7
+ *内核版本：linux-3.4.2
+ * 
+ * "=>" 代表函数调用
+ * 
+ */
+ 
+i2c框架中三种数据类型：
+	struct i2c_adapter	:		代表一个物理上的i2c控制器，一条物理总线
+	struct i2c_client		:		代表一个i2c设备
+	struct i2c_driver		:		代表一个操作i2c设备的驱动
+	
+	
+	i2c_adapter注册过程：
+		
+		s3c24xx_i2c_probe()
+			i2c_adapter.algo    = &s3c24xx_i2c_algorithm;															设置发送函数，重要的步骤
+			=>i2c_add_numbered_adapter(struct i2c_adapter *adap)
+				=>i2c_register_adapter(adap);
+					=>i2c_scan_static_board_info(adap)
+						=>list_for_each_entry(devinfo, &__i2c_board_list, list)							扫描__i2c_board_list链表，如果每个节点的总线号等于adapter的总线号，则调用i2c_new_device()函数创建i2c_client
+					=>bus_for_each_drv(&i2c_bus_type, NULL, adap, __process_new_adapter)	遍历i2c_bus_type虚拟总线里的i2c_driver的链表，对每一个i2c_driver调用__process_new_adapter()函数
+						=>__process_new_adapter(struct device_driver *d, void *data)				这里data参数是注册的adapter
+							=>i2c_do_add_adapter(to_i2c_driver(d), data)											通过device_driver找到i2c_driver，传入i2c_do_add_adapter
+								=>i2c_detect(adap, driver);																			探测adapter这个总线上能支持的设备，并实例化
+									address_list = driver->address_list;													取得i2c_driver中的address_list，在定义i2c_driver时，也可以设置一个地址列表来探测
+									temp_client->addr = address_list[i];
+									=>i2c_detect_address(temp_client, driver);										轮询地址列表里的每一个地址，探测是否有设备
+										=>i2c_default_probe(adapter, addr)
+										=>driver->detect(temp_client, &info);												调用i2c_driver中的detect()函数进行探测
+										=>i2c_new_device(adapter, &info);														如果探测到，则实例化一个i2c_client
+								driver->attach_adapter(adap);																		调用i2c_driver中的attach_adapter()函数
+						
+						
+	i2c_client注册的两种方法：
+	
+		第一种方法：
+		i2c_new_device(struct i2c_adapter *adap, struct i2c_board_info const *info)	利用info中指定的信息创建i2c_client
+			client = kzalloc(sizeof *client, GFP_KERNEL);
+			client->dev.bus = &i2c_bus_type;																			先设置好device的bus类型，在匹配的时候，可以通过device.bus找到i2c_bus_type的match函数
+			=>i2c_check_addr_busy(adap, client->addr)
+			=>device_register(&client->dev)
+				=>device_add(dev)
+					=>bus_add_device(dev);
+					=>bus_probe_device(dev)
+						=>device_attach(dev)
+							=>bus_for_each_drv(dev->bus, NULL, dev, __device_attach)									遍历i2c_bus_type总线上的device_driver，调用__device_attach()函数
+
+		__device_attach(struct device_driver *drv, void *data)							此时传入的data参数是device
+			=>driver_match_device(drv, dev)
+				=>drv->bus->match ? drv->bus->match(dev, drv) : 1;							调用i2c_bus_type的match函数进行匹配
+			=>driver_probe_device(drv, dev)
+				=>really_probe(dev, drv)
+					=>dev->bus->probe
+					=>drv->probe
+			
+		第二种方法：
+			i2c_new_probed_device(struct i2c_adapter * adap,struct i2c_board_info * info,
+														unsigned short const * addr_list,														地址列表
+														int(* probe)(struct i2c_adapter *,unsigned short addr))			探测函数，如果没有则是用默认的探测函数
+				if (!probe)
+					probe = i2c_default_probe;
+				=>probe(adap, addr_list[i])																											轮询探测地址
+				=>i2c_new_device(adap, info);	
+				
+				
+		
+	i2c_driver注册过程：
+	
+		i2c_add_driver(driver)
+			i2c_register_driver(THIS_MODULE, driver)
+				driver->driver.bus = &i2c_bus_type;																		先设置好device_driver的bus类型，在匹配的时候，可以通过device_driver.bus找到i2c_bus_type的match函数
+				driver_register(&driver->driver);
+					=>bus_add_driver(drv)
+						=>driver_attach(drv);
+							=>bus_for_each_dev(drv->bus, NULL, drv, __driver_attach);				遍历i2c_bus_type虚拟总线上的device列表，对每个device调用__driver_attach()函数
+							
+							
+		__driver_attach(struct device *dev, void *data)														此时传入的data参数是device_driver
+			=>driver_match_device(drv, dev)
+				drv->bus->match ? drv->bus->match(dev, drv) : 1;											调用i2c_bus_type总线的match函数，判断是否可以匹配
+			driver_probe_device(drv, dev)																						如果匹配则调用该函数
+				=>really_probe(dev, drv)
+					=>dev->bus->probe(dev)																							调用i2c_bus_type总线的probe函数
+					=>drv->probe(dev)																										调用
+							
+							
