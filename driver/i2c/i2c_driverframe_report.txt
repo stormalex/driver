@@ -6,10 +6,41 @@
  */
  
 i2c框架中三种数据类型：
-	struct i2c_adapter	:		代表一个物理上的i2c控制器，一条物理总线
+	struct i2c_adapter		:		代表一个物理上的i2c控制器，一条物理总线
 	struct i2c_client		:		代表一个i2c设备
 	struct i2c_driver		:		代表一个操作i2c设备的驱动
 	
+对I2C驱动框架整体理解
+=====================
+
+1.I2C控制器驱动
+---------------
+I2C控制器驱动是作为一个platform驱动存在于S3C2440的驱动框架中的。
+所以控制器驱动分为 platform_device 和 platform_driver ，platform_driver中注册的是控制器的驱动。
+控制器的驱动用结构体 struct i2c_adapter 表示。
+
+2.I2C设备驱动
+-------------
+每个I2C设备是通过I2C模块的 i2c_add_driver() 接口注册的。
+结构体 struct i2c_driver 代表了一个I2C的设备驱动，一个设备驱动可以对应多个设备
+
+3.I2C设备
+---------
+内核中一个结构体 struct i2c_client 代表一个I2C的设备。
+设备的创建（分配struct i2c_client）可以是自动的，也可以是手动的
+
+自动的方法，需要在设备驱动中实现 detect 方法并指明自动探测的地址列表 address_list ，当驱动探测到会自动分配struct i2c_client，
+如果是手动添加设备，不需要实现 detect 和 address_list ，具体代码参照 i2c-core.c 文件中的 i2c_detect() 函数
+
+手动的方法有多种：
+1.用户空间执行：echo at24c08 0x50 > /sys/bus/i2c/devices/i2c-总线号/new_device  （at24c08是设备名，0x50是设备地址）
+2.通过i2c的设备注册接口添加
+
+手动添加设备的方法，指定的设备名需要和设备驱动中的 id_table 表里的能匹配。
+	
+	
+以下是一些接口的实现：
+=====================
 	
 	i2c_adapter注册过程：
 		
