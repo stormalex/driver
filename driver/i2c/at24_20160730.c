@@ -13,6 +13,10 @@
 #include <linux/cdev.h>
 #include <linux/i2c.h>
 
+static int major;
+static struct class *class = NULL;
+static struct i2c_client *at24cxx_client;
+
 //板子上的i2c设备7bit地址是0101 0000
 static const unsigned short at24_addr_list[] = { 0x60, 0x50, 0x51, I2C_CLIENT_END };
 
@@ -40,13 +44,65 @@ static int at24_detect(struct i2c_client* client, struct i2c_board_info* info)
 		printk("[i2c_driver]at24_test_driver: detect ok, I2C_FUNC_I2C supported\n");
 	}*/
 
-	strlcpy(info->type, "test_dev_x", I2C_NAME_SIZE);
+	strlcpy(info->type, "test_dev_1", I2C_NAME_SIZE);  //这里的名字需要和 at24_id 表里的名字匹配到，驱动才能匹配到设备！！
 	return 0;
 }
 
+static ssize_t at24cxx_read(struct file *file, char __user *buf, size_t count, loff_t *off)
+{
+	u8 addr, data;
+
+	copy_from_user(&addr, buf, 1);
+
+	data = i2c_smbus_read_byte_data(at24cxx_client, addr);
+
+	copy_to_user(buf, &data, 1);
+
+	return 1;
+}
+
+static ssize_t at24cxx_write(struct file *file, const char __user *buf, size_t count, loff_t *off)
+{
+	u8 w_buf[2];
+	u8 addr,data;
+	s32 ret = 0;
+	
+	copy_from_user(w_buf, buf, 2);
+	
+	addr = w_buf[0];
+	data = w_buf[1];
+	
+	ret = i2c_smbus_write_byte_data(at24cxx_client, addr, data);
+	if(ret != 0)
+		return -EIO;
+
+	return count;
+}
+
+static const struct file_operations at24cxx_fops={
+	.owner = THIS_MODULE,
+	.read  = at24cxx_read,
+	.write = at24cxx_write,
+};
+
 static int at24_probe(struct i2c_client* client, const struct i2c_device_id* id)
 {
+	struct device* dev = NULL;
 	printk("match device:%s 0x%02x\n", client->name, client->addr);
+	
+	at24cxx_client = client;
+	
+	major = register_chrdev(0, "at24xx", &at24cxx_fops);
+	
+	class = class_create(THIS_MODULE, "at24xx");
+	if(!class) {
+		printk("class_create failed\n");
+	}
+	dev = device_create(class, NULL, MKDEV(major, 0), NULL, "at24c02");
+	if(!dev) {
+		printk("device_create failed\n");
+	}
+	
 	return 0;
 }
 
