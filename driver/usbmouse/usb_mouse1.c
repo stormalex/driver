@@ -1,6 +1,6 @@
 /*****************************************************
  *
- * å°†è®¾å¤‡ä½œä¸ºä¸€ä¸ªæ™®é€šçš„USBè®¾å¤‡æ³¨å†Œè¿›usbç³»ç»Ÿï¼Œä¸»è®¾å¤‡å·æ˜¯180
+ * ×¢²áÖ÷Éè±¸ºÅÎª 180 µÄÉè±¸½Úµã£¬Ò»Ì×Çı¶¯¿ÉÒÔÖ§³Ö¶à¸öÉè±¸µÄÊó±êÇı¶¯
  *
  *****************************************************/
 
@@ -12,11 +12,55 @@
 
 
 #define USB_MOUSE_MINOR_BASE    (200)
+#define USB_MOUSE_MAX_DEV		(10)
 
-static struct urb *usb_mouse_urb = NULL;
+struct usb_mouse_dev {
+	char name[16];
+	int devnum;
+    struct urb* irq_urb;
+    unsigned char int_in_endpointAddr;
+	void* int_in_buffer;
+	unsigned short int_in_size;
+	unsigned int int_in_pipe;
+	unsigned char int_in_interval;
+	struct usb_device *usb_device;
+};
+
+struct usb_mouse_map {
+	unsigned long mouse_map [USB_MOUSE_MAX_DEV / (8*sizeof (unsigned long))];
+};
+static struct usb_mouse_map devmap;
+
+static int usb_mouse_probe(struct usb_interface *intf, const struct usb_device_id *id);
+static void usb_mouse_disconnect(struct usb_interface *intf);
+static int usb_mouse_open(struct inode *inode, struct file *file);
+static ssize_t usb_mouse_read(struct file *file, char __user *buf, size_t size, loff_t *offset);
+static int usb_mouse_release(struct inode *inode, struct file *file);
 
 static const struct usb_device_id usb_mouse_id_table[] = {
     {USB_INTERFACE_INFO(USB_INTERFACE_CLASS_HID, USB_INTERFACE_SUBCLASS_BOOT, USB_INTERFACE_PROTOCOL_MOUSE)},
+    {},
+};
+
+static const struct file_operations usb_mouse_fops = {
+    .owner = THIS_MODULE,
+    .open = usb_mouse_open,
+    .read = usb_mouse_read,
+    .release = usb_mouse_release,
+};
+
+static struct usb_class_driver usb_mouse_class = {
+	//.name = "usb_mouse_class",
+	.fops = &usb_mouse_fops,
+	.minor_base = USB_MOUSE_MINOR_BASE,
+};
+
+
+static struct usb_driver usb_mouse_driver = {
+    .name = "usb_mouse1",
+    .probe = usb_mouse_probe,
+    .disconnect = usb_mouse_disconnect,
+    .id_table = usb_mouse_id_table,
 };
 
 static void usb_mouse_display_info(struct usb_device *usb_device, struct usb_interface *intf)
@@ -70,26 +114,10 @@ static void usb_mouse_display_info(struct usb_device *usb_device, struct usb_int
     return;    
 }
 
-static int usb_mouse_open(struct inode *inode, struct file *file)
-{
-    printk("open the usb mouse, major=%d, minor=%d\n", MAJOR(inode->i_rdev), MINOR(inode->i_rdev));
-    return 0;
-}
-
-static const struct file_operations adu_fops = {
-    .owner = THIS_MODULE,
-    .open = usb_mouse_open,
-};
-
-static struct usb_class_driver usb_mouse_class = {
-	.name = "usb_mouse_class",
-	.fops = &adu_fops,
-	.minor_base = USB_MOUSE_MINOR_BASE,
-};
-
 static void usb_mouse_irq(struct urb *urb)
 {
-    char* buf = (char*)urb->context;
+	struct usb_mouse_dev *usb_mouse_dev = (struct usb_mouse_dev*)urb->context;
+    char* buf = usb_mouse_dev->int_in_buffer;
     int status = urb->status;
     int i;
     
@@ -103,77 +131,150 @@ static void usb_mouse_irq(struct urb *urb)
 		printk("urb status = %d\n", status);
         goto resubmit;
 
-	case 0:			/* we got data:  port status changed */			/* è¯´æ˜urbè¢«é¡ºåˆ©å¤„ç†äº† */
+	case 0:			/* we got data:  port status changed */			/* urb±»ÕıÈ·´¦Àí */
         printk("actual data size = %d\n", urb->actual_length);
-		for (i = 0; i < urb->actual_length; ++i)					/* actual_lengthæ˜¯å®é™…çš„å­—èŠ‚æ•°ï¼Œå› ä¸ºæ¯ä¸ªhubçš„ç«¯å£æ•°éƒ½æ˜¯ä¸ä¸€æ ·çš„ï¼Œè¿™ä¸ªbitmapé‡Œæœ€å¤§çš„å®¹é‡æ˜¯ç«¯å£æ•°+1ï¼Œé¢å¤–çš„ä¸€ä½æ˜¯ä¸ºæ•´ä¸ªhubæä¾›çš„ */
+		for (i = 0; i < urb->actual_length; ++i)
 			printk("0x%02x\n", buf[i]);
         printk("\n");
 		break;
 	}
     
 resubmit:
-    if ((status = usb_submit_urb (usb_mouse_urb, GFP_ATOMIC)) != 0
+    if ((status = usb_submit_urb (urb, GFP_ATOMIC)) != 0
 			&& status != -ENODEV && status != -EPERM)
         printk("resubmit --> %d\n", status);
 }
 
-static int usb_mouse_probe(struct usb_interface *intf, const struct usb_device_id *id)
+static int usb_mouse_open(struct inode *inode, struct file *file)
 {
-    struct usb_device *usb_device = interface_to_usbdev(intf);
-    struct usb_host_endpoint *endpoint = intf->cur_altsetting->endpoint;
-    unsigned int pipe;
-    int maxp;
-    void *buf = NULL;
     int status;
+    unsigned int pipe;
+	struct usb_mouse_dev *usb_mouse_dev = NULL;
+	struct usb_interface *intf = NULL;
+	struct usb_device *usb_device = NULL;
     
-    usb_mouse_display_info(usb_device, intf);
-    
-    if(usb_register_dev(intf, &usb_mouse_class) < 0) {
-        printk("usb_register_dev error\n");
+    printk("open the usb mouse, major=%d, minor=%d\n", MAJOR(inode->i_rdev), MINOR(inode->i_rdev));
+
+	intf = usb_find_interface(&usb_mouse_driver, MINOR(inode->i_rdev));
+	usb_mouse_dev = usb_get_intfdata(intf);
+	printk("usb_mouse_dev = %p\n", usb_mouse_dev);
+
+	usb_device = usb_mouse_dev->usb_device;
+	pipe = usb_mouse_dev->int_in_pipe;
+	
+    usb_mouse_dev->irq_urb = usb_alloc_urb(0, GFP_KERNEL);
+    if(usb_mouse_dev->irq_urb == NULL) {
+        printk("usb_alloc_urb error\n");
         return -1;
     }
+
+	if(usb_mouse_dev->int_in_endpointAddr && usb_mouse_dev->int_in_buffer == NULL) {
+		usb_mouse_dev->int_in_buffer = kmalloc(usb_mouse_dev->int_in_size, GFP_KERNEL);
+		if(usb_mouse_dev->int_in_buffer == NULL) {
+			printk("kmalloc buffer failed\n");
+			goto err1;
+		}
+		usb_fill_int_urb(usb_mouse_dev->irq_urb, usb_device, pipe, usb_mouse_dev->int_in_buffer, usb_mouse_dev->int_in_size, usb_mouse_irq, usb_mouse_dev, usb_mouse_dev->int_in_interval);
     
-    usb_mouse_urb = usb_alloc_urb(0, GFP_KERNEL);
-    if(usb_mouse_urb == NULL) {
-        printk("usb_alloc_urb error\n");
-    }
-    
-    pipe = usb_rcvintpipe(usb_device, endpoint->desc.bEndpointAddress);
-    maxp = usb_maxpacket(usb_device, pipe, usb_pipeout(pipe));
-    buf = kmalloc(maxp, GFP_KERNEL);
-    if(buf == NULL) {
-        printk("kmalloc error\n");
+	    status = usb_submit_urb(usb_mouse_dev->irq_urb, GFP_NOIO);
+		if (status < 0) {
+	        printk("usb_submit_urb error\n");
+	        goto err2;
+	    }
+	}
+    return 0;
+err2:
+    kfree(usb_mouse_dev->int_in_buffer);
+err1:
+    usb_free_urb(usb_mouse_dev->irq_urb);
+    return -1;
+}
+
+static ssize_t usb_mouse_read(struct file *file, char __user *buf, size_t size, loff_t *offset)
+{
+	return 0;
+}
+
+static int usb_mouse_release(struct inode *inode, struct file *file)
+{
+	struct usb_interface *intf = NULL;
+	struct usb_mouse_dev *usb_mouse_dev = NULL;
+	intf = usb_find_interface(&usb_mouse_driver, MINOR(inode->i_rdev));
+	usb_mouse_dev = usb_get_intfdata(intf);
+	if(usb_mouse_dev->int_in_buffer) {
+		kfree(usb_mouse_dev->int_in_buffer);
+		usb_mouse_dev->int_in_buffer = NULL;
+	}
+	usb_kill_urb(usb_mouse_dev->irq_urb);
+    usb_free_urb(usb_mouse_dev->irq_urb);
+	return 0;
+}
+
+static int usb_mouse_probe(struct usb_interface *intf, const struct usb_device_id *id)
+{
+	struct usb_mouse_dev *usb_mouse_dev = NULL;
+    struct usb_device *usb_device = interface_to_usbdev(intf);
+	struct usb_endpoint_descriptor *endpoint_desc = NULL;
+    int i = 0;
+	
+    usb_mouse_display_info(usb_device, intf);
+
+	usb_mouse_dev = kzalloc(sizeof(*usb_mouse_dev), GFP_KERNEL);
+	if(usb_mouse_dev == NULL) {
+		printk("kmalloc error\n");
+		return -ENOMEM;
+	}
+	for(i = 0; i < intf->cur_altsetting->desc.bNumEndpoints; i++) {
+		printk("check %d endpoint\n", i+1);
+		endpoint_desc = &intf->cur_altsetting->endpoint[i].desc;
+		/* Èç¹ûÖĞ¶ÏÊäÈë¶Ëµã»¹Ã»ÓĞÉèÖÃ£¬ ¼ì²âÕâ¸ö¶ËµãÊÇ²»ÊÇÊäÈëÀàĞÍ£¬ ¼ì²âÕâ¸ö¶ËµãÊÇ²»ÊÇÖĞ¶ÏÀàĞÍ */
+		if(!usb_mouse_dev->int_in_endpointAddr && (endpoint_desc->bEndpointAddress & USB_DIR_IN) && ((endpoint_desc->bmAttributes & USB_ENDPOINT_XFERTYPE_MASK) == USB_ENDPOINT_XFER_INT)) {
+			usb_mouse_dev->int_in_endpointAddr = endpoint_desc->bEndpointAddress;
+			usb_mouse_dev->int_in_interval = endpoint_desc->bInterval;
+			usb_mouse_dev->int_in_pipe = usb_rcvintpipe(usb_device, endpoint_desc->bEndpointAddress);
+			usb_mouse_dev->int_in_size = __le16_to_cpu(endpoint_desc->wMaxPacketSize);
+		}
+	}
+	usb_mouse_dev->usb_device = usb_device;
+
+	
+	usb_set_intfdata(intf, usb_mouse_dev);
+	usb_mouse_dev->devnum = find_next_zero_bit(devmap.mouse_map, USB_MOUSE_MAX_DEV, 1);
+	if (usb_mouse_dev->devnum >= USB_MOUSE_MAX_DEV) {
+		printk ("too many usb mouse device\n");
+		goto err1;
+	}
+	set_bit (usb_mouse_dev->devnum, devmap.mouse_map);
+	
+	usb_mouse_class.name = usb_mouse_dev->name;
+	sprintf(usb_mouse_class.name, "usb_mouse_%d", usb_mouse_dev->devnum);
+	
+    if(usb_register_dev(intf, &usb_mouse_class) < 0) {
+        printk("usb_register_dev error\n");
         goto err1;
     }
-    printk("endpoint max data size = %d\n", maxp);
-    usb_fill_int_urb(usb_mouse_urb, usb_device, pipe, buf, maxp, usb_mouse_irq, buf, endpoint->desc.bInterval);
-    
-    status = usb_submit_urb(usb_mouse_urb, GFP_NOIO);
-	if (status < 0) {
-        printk("usb_submit_urb error\n");
-        goto err1;
-    }
-    
+	printk("register a usb device successfull: usb_mouse_dev=%p\n", usb_mouse_dev);
     return 0;
 
 err1:
-    usb_free_urb(usb_mouse_urb);
-    usb_deregister_dev(intf, &usb_mouse_class);
+	kfree(usb_mouse_dev);
+
     return -1;
 }
 
 static void usb_mouse_disconnect(struct usb_interface *intf)
 {
-    usb_free_urb(usb_mouse_urb);
-    usb_deregister_dev(intf, &usb_mouse_class);
-}
+	struct usb_mouse_dev *usb_mouse_dev = NULL;
 
-static struct usb_driver usb_mouse_driver = {
-    .name = "usb_mouse1",
-    .probe = usb_mouse_probe,
-    .disconnect = usb_mouse_disconnect,
-    .id_table = usb_mouse_id_table,
-};
+	usb_mouse_dev = usb_get_intfdata(intf);
+	
+    usb_deregister_dev(intf, &usb_mouse_class);
+	usb_set_intfdata(intf, NULL);
+	if(usb_mouse_dev->int_in_buffer)
+		kfree(usb_mouse_dev->int_in_buffer);
+	kfree(usb_mouse_dev);
+	clear_bit(usb_mouse_dev->devnum, devmap.mouse_map);
+}
 
 static int __init usb_mouse_init(void)
 {

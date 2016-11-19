@@ -46,7 +46,7 @@ void usbmouse_complete(struct urb *urb)
 	printk("\n");
 
 	//重新提交urb
-	usb_submit_urb(uk_urb, GFP_KERNEL);
+	usb_submit_urb(uk_urb, GFP_ATOMIC);
 }
 
 
