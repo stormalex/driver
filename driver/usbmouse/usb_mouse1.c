@@ -14,9 +14,14 @@
 #define USB_MOUSE_MINOR_BASE    (200)
 #define USB_MOUSE_MAX_DEV		(10)
 
+#define USB_DEV_TYPE_NONE		0
+#define USB_DEV_TYPE_MOUSE		1
+#define USB_DEV_TYPE_KEYBOARD	2
+
 struct usb_mouse_dev {
 	char name[16];
 	int devnum;
+	unsigned int dev_type;				/* mouse or keyboard */
     struct urb* irq_urb;
     unsigned char int_in_endpointAddr;
 	void* int_in_buffer;
@@ -24,6 +29,9 @@ struct usb_mouse_dev {
 	unsigned int int_in_pipe;
 	unsigned char int_in_interval;
 	struct usb_device *usb_device;
+
+	void* report_descriptor;
+	int report_desc_size;
 };
 
 struct usb_mouse_map {
@@ -63,9 +71,28 @@ static struct usb_driver usb_mouse_driver = {
     .id_table = usb_mouse_id_table,
 };
 
-static void usb_mouse_display_info(struct usb_device *usb_device, struct usb_interface *intf)
+static int get_class_descriptor(struct usb_device *dev, int ifnum, unsigned char type, void *buf, int size)
+{
+	int result, retries = 4;
+	memset(buf, 0, size);
+
+	do{
+		result = usb_control_msg(dev, usb_rcvctrlpipe(dev, 0), USB_REQ_GET_DESCRIPTOR, USB_RECIP_INTERFACE | USB_DIR_IN, 
+								(type << 8), ifnum, buf, size, USB_CTRL_GET_TIMEOUT);
+		retries--;
+	}while(result<size && retries);
+	return result;
+}
+
+static int usb_mouse_display_info(struct usb_mouse_dev *usb_mouse_dev, struct usb_device *usb_device, struct usb_interface *intf)
 {
     int i = 0;
+    int j = 0;
+	int alt_i = 0;
+	int ret = 0;
+	struct usb_descriptor_header *header;
+	struct hid_descriptor *hid_desc;
+	struct usb_device *dev = interface_to_usbdev(intf);
     
     printk("match a interface\n");
     printk("interface alt setting num=%d\n", intf->num_altsetting);
@@ -75,25 +102,25 @@ static void usb_mouse_display_info(struct usb_device *usb_device, struct usb_int
     printk("usb_device info:\n");
     printk("usb device devnum=%d\n", usb_device->devnum);
     
-    printk("usb device speed:\n");
+    printk("usb device speed:");
     switch(usb_device->speed) {
         case USB_SPEED_LOW:
-            printk("\tLOW SPEED\n");
+            printk("LOW SPEED\n");
             break;
         case USB_SPEED_FULL:
-            printk("\tFULL SPEED\n");
+            printk("FULL SPEED\n");
             break;
         case USB_SPEED_HIGH:
-            printk("\tHIGH SPEED\n");
+            printk("HIGH SPEED\n");
             break;
         case USB_SPEED_WIRELESS:
-            printk("\tWIRELESS SPEED\n");
+            printk("WIRELESS SPEED\n");
             break;
         case USB_SPEED_SUPER:
-            printk("\tSUPER SPEED\n");
+            printk("SUPER SPEED\n");
             break;
         default:
-            printk("\tUNKNOWN SPEED\n");
+            printk("UNKNOWN SPEED\n");
             break;
     }
     
@@ -101,17 +128,80 @@ static void usb_mouse_display_info(struct usb_device *usb_device, struct usb_int
     printk("level=%d\n", usb_device->level);
     
     printk("descriptor info:\n");
-    printk("\tvendor id=0x%04x\n", le16_to_cpu(usb_device->descriptor.idVendor));
-    printk("\tproduct id=0x%04x\n", le16_to_cpu(usb_device->descriptor.idProduct));
-    printk("\tconfigure num=%d\n", usb_device->descriptor.bNumConfigurations);
-    printk("\n\tconfigure:\n");
+    printk("  vendor id=0x%04x\n", le16_to_cpu(usb_device->descriptor.idVendor));
+    printk("  product id=0x%04x\n", le16_to_cpu(usb_device->descriptor.idProduct));
+    printk("  configure num=%d\n\n", usb_device->descriptor.bNumConfigurations);
+    printk("  configure information:\n");
     
     for(i = 0; i < usb_device->descriptor.bNumConfigurations; i++) {
-        printk("\t\ti=%d\n", i);
-        printk("\t\tbConfigurationValue = %d\n", usb_device->config[i].desc.bConfigurationValue);
-        printk("\t\tbNumInterfaces = %d\n", usb_device->config[i].desc.bNumInterfaces);
+        printk("    configure index=%d\n", i);
+        printk("    bConfigurationValue = %d\n", usb_device->config[i].desc.bConfigurationValue);
+		printk("    configure string = %s\n", usb_device->config[i].string);
+        printk("    bNumInterfaces = %d\n", usb_device->config[i].desc.bNumInterfaces);
+		for(j = 0; j < usb_device->config[i].desc.bNumInterfaces; j++) {									/* 遍历所有接口 */
+			printk("      configure %d,  interface index=%d\n", i, j);
+			printk("      altsetting num=%d\n", usb_device->config[i].intf_cache[j]->num_altsetting);
+			for(alt_i = 0; alt_i < usb_device->config[i].intf_cache[j]->num_altsetting; alt_i++) {					/* 遍历一个接口号下的所有设置，这里的每个描述符接口号一样，设置号不一样 */
+				printk("        altsetting index=%d\n", alt_i);
+				printk("        interface string = %s\n", usb_device->config[i].intf_cache[j]->altsetting[alt_i].string);
+				printk("        alternate setting = %d\n", usb_device->config[i].intf_cache[j]->altsetting[alt_i].desc.bAlternateSetting);
+				printk("        interface number = %d\n", usb_device->config[i].intf_cache[j]->altsetting[alt_i].desc.bInterfaceNumber);
+				printk("        interface class = %d\n", usb_device->config[i].intf_cache[j]->altsetting[alt_i].desc.bInterfaceClass);
+				printk("        interface protocal = %d\n", usb_device->config[i].intf_cache[j]->altsetting[alt_i].desc.bInterfaceProtocol);
+				printk("        endpoint number = %d\n", usb_device->config[i].intf_cache[j]->altsetting[alt_i].desc.bNumEndpoints);
+
+				if(usb_device->config[i].intf_cache[j]->altsetting[alt_i].extralen) {											/* 判断有没有额外描述符 */
+					printk("          额外描述符:\n");
+					header = (struct usb_descriptor_header *)usb_device->config[i].intf_cache[j]->altsetting[alt_i].extra;
+					if(header->bDescriptorType == 0x21) {
+						hid_desc = (struct hid_descriptor *)header;
+						printk("            HID descriptor, len:%d\n", hid_desc->bLength);
+						printk("            HID descriptor, type:0x%02x\n", hid_desc->bDescriptorType);
+						printk("            HID bNumDescriptors, num:%d\n", hid_desc->bNumDescriptors);
+						printk("            bDescriptorType : %s\n", hid_desc->desc[0].bDescriptorType==0x22?"report descriptor":"other descriptor");
+						printk("            wDescriptorLength, num:%d\n", le16_to_cpu(hid_desc->desc[0].wDescriptorLength));
+					}
+				}
+			}
+		}
     }
-    return;    
+
+
+	//set information
+	if(intf->cur_altsetting->desc.bInterfaceProtocol == USB_INTERFACE_PROTOCOL_KEYBOARD) {
+		usb_mouse_dev->dev_type = USB_DEV_TYPE_KEYBOARD;
+	}
+	else if(intf->cur_altsetting->desc.bInterfaceProtocol == USB_INTERFACE_PROTOCOL_MOUSE) {
+		usb_mouse_dev->dev_type = USB_DEV_TYPE_MOUSE;
+	}
+	else {
+		usb_mouse_dev->dev_type = USB_DEV_TYPE_NONE;
+	}
+
+	header = (struct usb_descriptor_header *)intf->cur_altsetting->extra;
+	if((intf->cur_altsetting->extralen != 0) && (header->bDescriptorType == HID_DT_HID)) {
+		hid_desc = (struct hid_descriptor *)header;
+		if(hid_desc->bDescriptorType == HID_DT_REPORT) {
+			usb_mouse_dev->report_desc_size = hid_desc->desc[0].wDescriptorLength;
+			usb_mouse_dev->report_descriptor = kmalloc(usb_mouse_dev->report_desc_size, GFP_KERNEL);
+			if(usb_mouse_dev->report_descriptor == NULL) {
+				printk("kmalloc failed\n");
+				return -ENOMEM;
+			}
+			ret = get_class_descriptor(dev, intf->cur_altsetting->desc.bInterfaceNumber, HID_DT_REPORT, usb_mouse_dev->report_descriptor, usb_mouse_dev->report_desc_size);
+			if(ret != usb_mouse_dev->report_desc_size) {
+				goto err1;
+			}
+		}
+	}
+
+	return 0;
+err1:
+	if(usb_mouse_dev->report_descriptor != NULL) {
+		kfree(usb_mouse_dev->report_descriptor);
+	}
+	
+    return -1;    
 }
 
 static void usb_mouse_irq(struct urb *urb)
@@ -134,7 +224,7 @@ static void usb_mouse_irq(struct urb *urb)
 	case 0:			/* we got data:  port status changed */			/* urb被正确处理 */
         printk("actual data size = %d\n", urb->actual_length);
 		for (i = 0; i < urb->actual_length; ++i)
-			printk("0x%02x\n", buf[i]);
+			printk("0x%02x ", buf[i]);
         printk("\n");
 		break;
 	}
@@ -216,14 +306,15 @@ static int usb_mouse_probe(struct usb_interface *intf, const struct usb_device_i
     struct usb_device *usb_device = interface_to_usbdev(intf);
 	struct usb_endpoint_descriptor *endpoint_desc = NULL;
     int i = 0;
-	
-    usb_mouse_display_info(usb_device, intf);
 
 	usb_mouse_dev = kzalloc(sizeof(*usb_mouse_dev), GFP_KERNEL);
 	if(usb_mouse_dev == NULL) {
 		printk("kmalloc error\n");
 		return -ENOMEM;
 	}
+
+	usb_mouse_display_info(usb_mouse_dev, usb_device, intf);
+	
 	for(i = 0; i < intf->cur_altsetting->desc.bNumEndpoints; i++) {
 		printk("check %d endpoint\n", i+1);
 		endpoint_desc = &intf->cur_altsetting->endpoint[i].desc;
@@ -272,6 +363,8 @@ static void usb_mouse_disconnect(struct usb_interface *intf)
 	usb_set_intfdata(intf, NULL);
 	if(usb_mouse_dev->int_in_buffer)
 		kfree(usb_mouse_dev->int_in_buffer);
+	if(usb_mouse_dev->report_descriptor)
+		kfree(usb_mouse_dev->report_descriptor);
 	kfree(usb_mouse_dev);
 	clear_bit(usb_mouse_dev->devnum, devmap.mouse_map);
 }
