@@ -13,7 +13,8 @@
 int main(int argc, char* argv[])
 {
     int fd = 0;
-	char buf[10];
+	char buf[2048];
+	int i = 0;
     
     if(argv[1] == NULL) {
         printf("Usage:app /dev/usb_mouse_xx\n");
@@ -47,8 +48,16 @@ int main(int argc, char* argv[])
 		printf("select OK, ret=%d\n", ret);
 		if(FD_ISSET(fd, &rd_set)) {
 			printf("fd=%d can read\n", fd);
-			ret = read(fd, buf, 4);
-			printf("read %d bytes data: %c %c\n", ret, buf[0], buf[1]);
+			do {
+				ret = read(fd, buf, 4);
+				printf("[%d]", ret);
+				if(ret > 0) {
+					for(i = 0; i < ret; i++) {
+						printf(" [0x%02x]", buf[i]);
+					}
+				}
+				printf("\n");
+			}while(ret > 0);
 		}
 	}
 	

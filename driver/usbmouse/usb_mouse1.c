@@ -10,6 +10,7 @@
 #include <linux/usb.h>
 #include <linux/hid.h>
 #include <linux/poll.h>
+#include <linux/spinlock_types.h>
 
 #define USB_MOUSE_MINOR_BASE    (200)
 #define USB_MOUSE_MAX_DEV		(10)
@@ -18,11 +19,9 @@
 #define USB_DEV_TYPE_MOUSE		1
 #define USB_DEV_TYPE_KEYBOARD	2
 
-#define RING_BUFFER_SIZE	(10)
+#define RING_BUFFER_SIZE	(200)
 
 struct usb_mouse_dev {
-	char name[16];
-	int devnum;
 	unsigned int dev_type;				/* mouse or keyboard */
 
 	/* interrupt endpoint info */
@@ -41,19 +40,17 @@ struct usb_mouse_dev {
 	int report_desc_size;
 
 	/* data buffer */
-	void* ring_buf;
-	void* wp;
-	void* rp;
+	char* ring_buf;
+	int ring_buf_size;
+	int wp;
+	int rp;
 	int ring_data_size;
+	spinlock_t ring_buf_lock;
+	char* read_buf;
 
 	/* wait queue */
 	wait_queue_head_t read_q;
 };
-
-struct usb_mouse_map {
-	unsigned long mouse_map [USB_MOUSE_MAX_DEV / (8*sizeof (unsigned long))];
-};
-static struct usb_mouse_map devmap;
 
 static int usb_mouse_probe(struct usb_interface *intf, const struct usb_device_id *id);
 static void usb_mouse_disconnect(struct usb_interface *intf);
@@ -63,7 +60,7 @@ static unsigned int usb_mouse_poll(struct file *, struct poll_table_struct *);
 static int usb_mouse_release(struct inode *inode, struct file *file);
 
 static const struct usb_device_id usb_mouse_id_table[] = {
-    {USB_INTERFACE_INFO(USB_INTERFACE_CLASS_HID, USB_INTERFACE_SUBCLASS_BOOT, USB_INTERFACE_PROTOCOL_MOUSE)},
+    {USB_INTERFACE_INFO(USB_INTERFACE_CLASS_HID, USB_INTERFACE_SUBCLASS_BOOT, USB_INTERFACE_PROTOCOL_MOUSE)},  /* 只能匹配到鼠标的接口 */
     {},
 };
 
@@ -76,7 +73,7 @@ static const struct file_operations usb_mouse_fops = {
 };
 
 static struct usb_class_driver usb_mouse_class = {
-	//.name = "usb_mouse_class",
+	.name = "usb_mouse_%d",
 	.fops = &usb_mouse_fops,
 	.minor_base = USB_MOUSE_MINOR_BASE,
 };
@@ -222,11 +219,16 @@ err1:
     return -1;    
 }
 
+static int index_move_step(int index, int step, int length)
+{
+	return index = ((index + step) % length);
+}
+
 static void usb_mouse_irq(struct urb *urb)
 {
 	struct usb_mouse_dev *usb_mouse_dev = (struct usb_mouse_dev*)urb->context;
-    //char* buf = usb_mouse_dev->int_in_buffer;
     int status = urb->status;
+	int step = usb_mouse_dev->int_in_size;
     
     switch (status) {
 	case -ENOENT:		/* synchronous unlink */
@@ -239,8 +241,18 @@ static void usb_mouse_irq(struct urb *urb)
         goto resubmit;
 
 	case 0:			/* we got data:  port status changed */			/* urb被正确处理 */
-		usb_mouse_dev->ring_data_size = 2;
-        wake_up_interruptible(&usb_mouse_dev->read_q);
+		if(urb->actual_length != step)
+			goto resubmit;
+		
+		if(index_move_step(usb_mouse_dev->wp, step, usb_mouse_dev->ring_buf_size) == usb_mouse_dev->rp){		//full, write over
+			memcpy((void *)&usb_mouse_dev->ring_buf[usb_mouse_dev->wp], usb_mouse_dev->int_in_buffer, step);
+			wake_up_interruptible(&usb_mouse_dev->read_q);
+		}
+		else if(index_move_step(usb_mouse_dev->wp, step, usb_mouse_dev->ring_buf_size) != usb_mouse_dev->rp) {		//have space
+			memcpy(&usb_mouse_dev->ring_buf[usb_mouse_dev->wp], usb_mouse_dev->int_in_buffer, step);
+			usb_mouse_dev->wp = index_move_step(usb_mouse_dev->wp, step, usb_mouse_dev->ring_buf_size);
+			wake_up_interruptible(&usb_mouse_dev->read_q);
+		}
 		
 		break;
 	}
@@ -285,22 +297,32 @@ static int usb_mouse_open(struct inode *inode, struct file *file)
 		usb_fill_int_urb(usb_mouse_dev->irq_urb, usb_device, pipe, usb_mouse_dev->int_in_buffer, usb_mouse_dev->int_in_size, usb_mouse_irq, usb_mouse_dev, usb_mouse_dev->int_in_interval);
 	}
 
-	usb_mouse_dev->ring_buf = kmalloc(RING_BUFFER_SIZE * usb_mouse_dev->int_in_size, GFP_KERNEL);
+	spin_lock_init(&usb_mouse_dev->ring_buf_lock);
+	usb_mouse_dev->ring_buf = kmalloc(RING_BUFFER_SIZE * usb_mouse_dev->int_in_size, GFP_KERNEL);		/* 循环缓冲区分配空间 */
 	if(usb_mouse_dev->ring_buf == NULL) {
 		printk("Ring buffer kmalloc failed\n");
 		goto err2;
 	}
-	usb_mouse_dev->wp = usb_mouse_dev->ring_buf;
-	usb_mouse_dev->rp = usb_mouse_dev->ring_buf;
+	usb_mouse_dev->read_buf = kmalloc(RING_BUFFER_SIZE * usb_mouse_dev->int_in_size, GFP_KERNEL);
+	if(usb_mouse_dev->read_buf == NULL) {
+		printk("Read buffer kmalloc failed\n");
+		goto err3;
+	}
+	usb_mouse_dev->ring_buf_size = RING_BUFFER_SIZE * usb_mouse_dev->int_in_size;
+	usb_mouse_dev->wp = 0;
+	usb_mouse_dev->rp = 0;
 	usb_mouse_dev->ring_data_size = 0;
 
 	status = usb_submit_urb(usb_mouse_dev->irq_urb, GFP_NOIO);
 	if (status < 0) {
         printk("usb_submit_urb error\n");
-        goto err3;
+        goto err4;
     }
 	
     return 0;
+err4:
+	if(usb_mouse_dev->read_buf)
+		kfree(usb_mouse_dev->read_buf);
 err3:
 	if(usb_mouse_dev->ring_buf)
 		kfree(usb_mouse_dev->ring_buf);
@@ -316,19 +338,33 @@ err1:
 static ssize_t usb_mouse_read(struct file *file, char __user *buf, size_t size, loff_t *offset)
 {
 	unsigned long ret = 0;
+	int step;
+	int read_data_size = 0;
+	
 	struct usb_mouse_dev *usb_mouse_dev = (struct usb_mouse_dev *)file->private_data;
 
-	memset(usb_mouse_dev->ring_buf, 'A', 2);
+	step = usb_mouse_dev->int_in_size;
+
+	if(usb_mouse_dev->wp == usb_mouse_dev->rp)
+		return 0;
+
+	size = size - (size % step);
 	
-	ret = copy_to_user(buf, usb_mouse_dev->ring_buf, 2);
+	while((usb_mouse_dev->wp != usb_mouse_dev->rp) && (size > read_data_size)) {
+		memcpy(usb_mouse_dev->read_buf + read_data_size, &usb_mouse_dev->ring_buf[usb_mouse_dev->rp], step);
+		read_data_size += step;
+		usb_mouse_dev->rp = index_move_step(usb_mouse_dev->rp, step, usb_mouse_dev->ring_buf_size);
+	}
+	ret = copy_to_user(buf, usb_mouse_dev->read_buf, read_data_size);
 	if(ret != 0) {
 		printk("copy_to_user failed\n");
+		return read_data_size - ret;
 	}
 	else {
-		usb_mouse_dev->ring_data_size = 0;
+		return read_data_size;
 	}
 	
-	return 2;
+	return 0;
 }
 
 static unsigned int usb_mouse_poll(struct file *file, struct poll_table_struct *table)
@@ -338,7 +374,7 @@ static unsigned int usb_mouse_poll(struct file *file, struct poll_table_struct *
 
 	poll_wait(file, &usb_mouse_dev->read_q, table);
 
-	if(usb_mouse_dev->ring_data_size) {
+	if(usb_mouse_dev->wp != usb_mouse_dev->rp) {
 		mask |= POLLIN | POLLRDNORM;							/* 可读取 */
 	}
 	return mask;
@@ -348,6 +384,10 @@ static int usb_mouse_release(struct inode *inode, struct file *file)
 {
 	struct usb_mouse_dev *usb_mouse_dev = (struct usb_mouse_dev *)file->private_data;
 
+	if(usb_mouse_dev->read_buf) {
+		kfree(usb_mouse_dev->read_buf);
+		usb_mouse_dev->read_buf = NULL;
+	}
 	if(usb_mouse_dev->ring_buf) {
 		kfree(usb_mouse_dev->ring_buf);
 		usb_mouse_dev->ring_buf = NULL;
@@ -399,15 +439,6 @@ static int usb_mouse_probe(struct usb_interface *intf, const struct usb_device_i
 
 	
 	usb_set_intfdata(intf, usb_mouse_dev);
-	usb_mouse_dev->devnum = find_next_zero_bit(devmap.mouse_map, USB_MOUSE_MAX_DEV, 1);
-	if (usb_mouse_dev->devnum >= USB_MOUSE_MAX_DEV) {
-		printk ("too many usb mouse device\n");
-		goto err1;
-	}
-	set_bit (usb_mouse_dev->devnum, devmap.mouse_map);
-	
-	usb_mouse_class.name = usb_mouse_dev->name;
-	sprintf(usb_mouse_class.name, "usb_mouse_%d", usb_mouse_dev->devnum);
 	
     if(usb_register_dev(intf, &usb_mouse_class) < 0) {
         printk("usb_register_dev error\n");
@@ -435,7 +466,6 @@ static void usb_mouse_disconnect(struct usb_interface *intf)
 	if(usb_mouse_dev->report_descriptor)
 		kfree(usb_mouse_dev->report_descriptor);
 	kfree(usb_mouse_dev);
-	clear_bit(usb_mouse_dev->devnum, devmap.mouse_map);
 }
 
 static int __init usb_mouse_init(void)
